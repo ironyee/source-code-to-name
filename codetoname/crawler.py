@@ -1,31 +1,33 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import json
-import github
 import elasticsearch
 import elasticsearch_dsl
 
 from elasticsearch_dsl.aggs import A
+from codetoname import github
 from codetoname.features import from_repo
 
 
 class Crawler:
     def __init__(self, index='codetoname', page_num=0, page_size=10,
                  language='python', account=None, password=None):
+        assert account and password
+
+        self._loop = asyncio.get_event_loop()
+        self._github_client = github.Github(account, password)
         self._es = elasticsearch.Elasticsearch()
         self._es_index = index
         self._page_num = page_num
         self._page_size = page_size
-        self._language = language
-        if account and password:
-            github_client = github.Github(account, password)
-            print('Hi, {}'.format(github_client.get_user().name))
-        else:
-            github_client = github.Github()
-
-        self._github_response = github_client.search_repositories(
-            query='language:{}'.format(self._language.strip()))
-
         self._latest_repo_index = False
+
+        self.create_index()
+        self._language = language.strip()
+        self._latest_pushed = None
+
+    def close(self):
+        self._github_client.close()
 
     def delete_index(self):
         if self._es.indices.exists(index=self._es_index):
@@ -56,28 +58,46 @@ class Crawler:
         return [{'url': r.clone_url, 'branch': r.default_branch, 'github_id': r.id, 'fork': r.fork} for r in repos]
 
     def next(self):
-        self.create_index()
-        for repo in self.fetch_github_repos():
-            print('[{:4d}] {}'.format(self._page_num, repo['url']))
-            if not self.exists_repos_in_database(repo['github_id']):
-                try:
-                    features = from_repo(repo, language=self._language)
-                    for f in features:
-                        self._es.index(
-                            index=self._es_index,
-                            doc_type=self._language,
-                            body={'repo': repo, 'feature': json.dumps(f)}
-                        )
-                    if not features:
-                        self._es.index(
-                            index=self._es_index,
-                            doc_type=self._language,
-                            body={'repo': repo})
-                    self._es.indices.refresh(index=self._es_index)
-                except Exception as e:
-                    print(repo)
-                    print(f) if f else None
-                    print(e)
+        response = self._loop.run_until_complete(
+            self._github_client.search_repositories(
+                language=self._language,
+                pushed=self._latest_pushed,
+                sort='updated',
+                order='asc'
+            )
+        )
+
+        repositories = [
+            {
+                'url': item['clone_url'],
+                'branch': item['default_branch'],
+                'github_id': item['id'],
+                'fork': item['fork']
+            } for item in response['items']
+        ]
+
+        for repository in repositories:
+            if self.exists_repos_in_database(repository['github_id']):
+                continue
+
+            try:
+                features = from_repo(repository, language=self._language)
+                for f in features:
+                    self._es.index(
+                        index=self._es_index,
+                        doc_type=self._language,
+                        body={'repo': repository, 'feature': json.dumps(f)}
+                    )
+                if not features:
+                    self._es.index(
+                        index=self._es_index,
+                        doc_type=self._language,
+                        body={'repo': repository})
+                self._es.indices.refresh(index=self._es_index)
+            except Exception as e:
+                print(repository)
+                print(f) if f else None
+                print(e)
 
     def exists_repos_in_database(self, github_id):
         if 0 != elasticsearch_dsl \
